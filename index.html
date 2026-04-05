@@ -1,0 +1,923 @@
+import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
+import {
+  Camera, ClipboardList, Database, Upload, Archive, Search, Download,
+  Copy, Lock, Menu, X, ScanLine, Image as ImageIcon, Plus, Trash2,
+  ChevronDown, ChevronUp, AlertTriangle, CheckCircle2, Clock,
+  Pill, Package, FlaskConical, Tag, Zap, RefreshCw, Eye, Star
+} from 'lucide-react';
+
+// ── Expiry colour logic ──────────────────────────────────────────
+function getExpiryStatus(expiryStr) {
+  if (!expiryStr) return { status: 'missing', label: 'No Expiry', color: 'grey' };
+  const exp = new Date(expiryStr);
+  const now = new Date();
+  if (isNaN(exp.getTime())) return { status: 'missing', label: 'No Expiry', color: 'grey' };
+  const diffDays = Math.ceil((exp - now) / (1000 * 60 * 60 * 24));
+  if (diffDays < 0)   return { status: 'expired',  label: 'Expired',       color: 'red'    };
+  if (diffDays <= 90) return { status: 'critical', label: '≤3 mo',         color: 'red'    };
+  if (diffDays <= 180)return { status: 'warning',  label: '3–6 mo',        color: 'amber'  };
+  return                     { status: 'ok',       label: '>6 mo',         color: 'green'  };
+}
+
+const EXPIRY_ROW_BG = {
+  expired:  'bg-red-600',
+  critical: 'bg-red-500',
+  warning:  'bg-amber-400',
+  ok:       'bg-emerald-500',
+  missing:  'bg-slate-400',
+};
+const EXPIRY_ROW_TEXT = {
+  expired:  'text-white',
+  critical: 'text-white',
+  warning:  'text-white',
+  ok:       'text-white',
+  missing:  'text-white',
+};
+const EXPIRY_BADGE_BG = {
+  red:   'bg-red-100 text-red-800 border-red-300',
+  amber: 'bg-amber-100 text-amber-800 border-amber-300',
+  green: 'bg-emerald-100 text-emerald-800 border-emerald-300',
+  grey:  'bg-slate-100 text-slate-700 border-slate-300',
+  blue:  'bg-blue-100 text-blue-800 border-blue-300',
+};
+
+// ── GS1 parser ───────────────────────────────────────────────────
+function parseGs1(raw) {
+  const clean = raw.replace(/[\[\]]/g, '').trim();
+  const result = { raw, gtin14: '', gtin13: '', expiry: '', batch: '', serial: '', qty: 1 };
+  const ais = {};
+  let i = 0;
+  const AI_LENS = { '01': 14, '02': 14, '10': -1, '17': 6, '21': -1, '37': -1, '30': -1 };
+  while (i < clean.length) {
+    if (clean[i] === '(') {
+      const end = clean.indexOf(')', i);
+      if (end < 0) break;
+      const ai = clean.slice(i + 1, end);
+      i = end + 1;
+      const len = AI_LENS[ai];
+      let val = '';
+      if (len > 0) { val = clean.slice(i, i + len); i += len; }
+      else { const nextParen = clean.indexOf('(', i); val = nextParen < 0 ? clean.slice(i) : clean.slice(i, nextParen); i += val.length; }
+      ais[ai] = val;
+    } else { i++; }
+  }
+  if (ais['01']) {
+    result.gtin14 = ais['01'];
+    const g = ais['01'].replace(/^0+/, '');
+    result.gtin13 = g.length <= 13 ? g.padStart(13, '0') : g.slice(-13);
+  }
+  if (ais['17']) {
+    const d = ais['17'];
+    if (d.length === 6) result.expiry = `20${d.slice(0,2)}-${d.slice(2,4)}-${d.slice(4,6)}`;
+  }
+  result.batch  = ais['10'] || '';
+  result.serial = ais['21'] || '';
+  result.qty    = ais['37'] ? parseInt(ais['37'], 10) || 1 : 1;
+  return result;
+}
+
+// ── Dummy master ──────────────────────────────────────────────────
+const INITIAL_MASTER = [
+  { gtin14: '05012345678900', gtin13: '5012345678900', name: 'Paracetamol 500mg Pack', type: 'TAB', form: 'Tablet' },
+  { gtin14: '05098765432100', gtin13: '5098765432100', name: 'Ibuprofen 200mg',        type: 'TAB', form: 'Tablet' },
+  { gtin14: '05055555555555', gtin13: '5055555555555', name: 'Amoxicillin 250mg',      type: 'CAP', form: 'Capsule' },
+  { gtin14: '05044444444444', gtin13: '5044444444444', name: 'Bandages Standard',      type: 'SUP', form: 'Supply' },
+  { gtin14: '05011111111111', gtin13: '5011111111111', name: 'Aspirin 75mg',           type: 'TAB', form: 'Tablet' },
+  { gtin14: '05099999999999', gtin13: '5099999999999', name: 'Omeprazole 20mg',        type: 'CAP', form: 'Capsule' },
+  { gtin14: '05088888888888', gtin13: '5088888888888', name: 'Vitamin C 1000mg',       type: 'TAB', form: 'Tablet' },
+  { gtin14: '05077777777777', gtin13: '5077777777777', name: 'Metformin 500mg',        type: 'TAB', form: 'Tablet' },
+];
+
+const INITIAL_HISTORY = [
+  { id: 1, scanTime: '2023-10-25T10:30:00Z', raw: '(01)05012345678900(17)260630(10)A1B2',         gtin14: '05012345678900', gtin13: '5012345678900', expiry: '2026-06-30', batch: 'A1B2', serial: '', qty: 2,  productName: 'Paracetamol 500mg Pack', matchType: 'EXACT', type: 'TAB', photo: null, note: '' },
+  { id: 2, scanTime: '2023-10-26T11:15:00Z', raw: '(01)05098765432100(17)250415(10)X9Y8(21)12345',gtin14: '05098765432100', gtin13: '5098765432100', expiry: '2025-04-15', batch: 'X9Y8', serial: '12345', qty: 1,  productName: 'Ibuprofen 200mg',        matchType: 'LAST8', type: 'TAB', photo: null, note: '' },
+  { id: 3, scanTime: '2023-10-26T14:20:00Z', raw: '(01)05055555555555(17)241001(10)B7C8',         gtin14: '05055555555555', gtin13: '5055555555555', expiry: '2024-10-01', batch: 'B7C8', serial: '', qty: 5,  productName: 'Amoxicillin 250mg',      matchType: 'EXACT', type: 'CAP', photo: null, note: '' },
+  { id: 4, scanTime: '2023-10-27T09:05:00Z', raw: '(01)05044444444444(10)Z1Z2',                   gtin14: '05044444444444', gtin13: '5044444444444', expiry: '',           batch: 'Z1Z2', serial: '', qty: 1,  productName: 'Bandages Standard',      matchType: 'SEQ6',  type: 'SUP', photo: null, note: '' },
+  { id: 5, scanTime: '2023-10-27T16:45:00Z', raw: '(01)05011111111111(17)231201(10)Q1W2',         gtin14: '05011111111111', gtin13: '5011111111111', expiry: '2023-12-01', batch: 'Q1W2', serial: '', qty: 10, productName: 'Aspirin 75mg',           matchType: 'NONE',  type: 'TAB', photo: null, note: '' },
+];
+
+// ── Formatters ────────────────────────────────────────────────────
+const fmtDate = iso => !iso ? '—' : new Date(iso).toLocaleDateString('en-GB', { day:'2-digit', month:'2-digit', year:'2-digit' });
+const fmtTime = iso => !iso ? '—' : new Date(iso).toLocaleTimeString('en-GB', { hour:'2-digit', minute:'2-digit' });
+
+// ── Type badge ────────────────────────────────────────────────────
+const TYPE_META = {
+  TAB: { icon: '💊', label: 'TAB', bg: 'bg-blue-100 text-blue-800 border-blue-200' },
+  CAP: { icon: '💉', label: 'CAP', bg: 'bg-purple-100 text-purple-800 border-purple-200' },
+  SYP: { icon: '🧴', label: 'SYP', bg: 'bg-cyan-100 text-cyan-800 border-cyan-200' },
+  SUP: { icon: '📦', label: 'SUP', bg: 'bg-slate-100 text-slate-700 border-slate-200' },
+  INJ: { icon: '💉', label: 'INJ', bg: 'bg-red-100 text-red-800 border-red-200' },
+  OTH: { icon: '🏷️', label: 'OTH', bg: 'bg-green-100 text-green-800 border-green-200' },
+};
+
+// ── Haptic helper ─────────────────────────────────────────────────
+function haptic(type = 'light') {
+  if (!navigator.vibrate) return;
+  if (type === 'success') navigator.vibrate([40, 30, 60]);
+  else if (type === 'error') navigator.vibrate([80, 40, 80, 40, 80]);
+  else navigator.vibrate(30);
+}
+
+// ── Scan animation overlay ────────────────────────────────────────
+function ScanSuccessOverlay({ item, onDone }) {
+  useEffect(() => { const t = setTimeout(onDone, 2200); return () => clearTimeout(t); }, [onDone]);
+  const es = getExpiryStatus(item?.expiry);
+  const gradMap = { red:'from-red-600 to-red-800', amber:'from-amber-500 to-orange-600', green:'from-emerald-500 to-green-700', grey:'from-slate-500 to-slate-700' };
+  return (
+    <div className="fixed inset-0 z-50 flex flex-col items-center justify-center" style={{ background:'rgba(0,0,0,0.7)', backdropFilter:'blur(8px)' }}>
+      <div className="animate-bounce-in flex flex-col items-center gap-4 bg-white rounded-3xl p-8 mx-6 max-w-sm w-full shadow-2xl text-center">
+        <div className={`w-20 h-20 rounded-full bg-gradient-to-br ${gradMap[es.color]} flex items-center justify-center shadow-lg`}>
+          <CheckCircle2 className="w-10 h-10 text-white" />
+        </div>
+        <div>
+          <div className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-1">Scanned</div>
+          <div className="text-xl font-black text-slate-900">{item?.productName || 'Unknown Product'}</div>
+          <div className="text-sm text-slate-500 mt-1 font-mono">{item?.gtin14}</div>
+        </div>
+        <div className="flex gap-3">
+          {item?.type && <span className={`px-3 py-1 rounded-full text-xs font-bold border ${(TYPE_META[item.type] || TYPE_META.OTH).bg}`}>{(TYPE_META[item.type] || TYPE_META.OTH).icon} {item.type}</span>}
+          <span className={`px-3 py-1 rounded-full text-xs font-bold border ${EXPIRY_BADGE_BG[es.color]}`}>Exp: {fmtDate(item?.expiry)}</span>
+        </div>
+        <div className="w-full bg-slate-100 rounded-xl p-3 text-sm text-slate-700">
+          Batch: <span className="font-mono font-bold">{item?.batch || '—'}</span>
+          <span className="mx-3 text-slate-300">|</span>
+          Qty: <span className="font-bold">{item?.qty}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Product image widget ──────────────────────────────────────────
+function ProductThumb({ name, photo, gtin, size = 'md' }) {
+  const [imgSrc, setImgSrc] = useState(photo || null);
+  const [tried, setTried] = useState(false);
+
+  useEffect(() => {
+    if (!photo && name && !tried) {
+      // Use Unsplash source (free, no key needed) as fallback visual
+      const query = encodeURIComponent(name.replace(/\d+mg|\d+ml|pack|tablet|capsule/gi, '').trim() || 'medicine');
+      setImgSrc(`https://source.unsplash.com/80x80/?pharmacy,${query}`);
+      setTried(true);
+    }
+  }, [name, photo, tried]);
+
+  const sz = size === 'sm' ? 'w-8 h-8' : 'w-12 h-12';
+  const icSz = size === 'sm' ? 'w-4 h-4' : 'w-6 h-6';
+
+  if (imgSrc) {
+    return (
+      <img src={imgSrc} alt={name} onError={() => setImgSrc(null)}
+        className={`${sz} rounded-xl object-cover border border-slate-200 flex-shrink-0`} />
+    );
+  }
+  return (
+    <div className={`${sz} rounded-xl bg-gradient-to-br from-blue-50 to-slate-100 border border-slate-200 flex items-center justify-center flex-shrink-0`}>
+      <Package className={`${icSz} text-blue-300`} />
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────
+export default function App() {
+  const [activeTab, setActiveTab] = useState('scan');
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const [pinUnlocked, setPinUnlocked] = useState(false);
+  const [pinInput, setPinInput] = useState('');
+
+  const [history, setHistory] = useState(INITIAL_HISTORY);
+  const [master, setMaster]   = useState(INITIAL_MASTER);
+
+  const [searchQuery, setSearchQuery] = useState('');
+  const [filters, setFilters] = useState({ expired: false, soon: false, missing: false });
+  const [sortBy, setSortBy]   = useState('scanTime');
+  const [sortDir, setSortDir] = useState('desc');
+  const [bulkText, setBulkText] = useState('');
+
+  const [scanOverlay, setScanOverlay] = useState(null);
+  const [scanInput, setScanInput]    = useState('');
+  const [expandedRow, setExpandedRow] = useState(null);
+  const [editingRow, setEditingRow]   = useState(null);
+
+  const fileInputRef = useRef(null);
+  const masterFileRef = useRef(null);
+  const photoInputRef = useRef(null);
+
+  // Match product from master
+  const matchProduct = useCallback((parsed) => {
+    const exact = master.find(m => m.gtin14 === parsed.gtin14);
+    if (exact) return { ...exact, matchType: 'EXACT' };
+    const last8 = master.find(m => m.gtin14.slice(-8) === parsed.gtin14.slice(-8));
+    if (last8) return { ...last8, matchType: 'LAST8' };
+    return null;
+  }, [master]);
+
+  // Process a single barcode string
+  const processBarcode = useCallback((raw) => {
+    const parsed = parseGs1(raw.trim());
+    if (!parsed.gtin14) return null;
+    const match = matchProduct(parsed);
+    return {
+      id: Date.now() + Math.random(),
+      scanTime: new Date().toISOString(),
+      raw: parsed.raw,
+      gtin14: parsed.gtin14,
+      gtin13: parsed.gtin13,
+      expiry: parsed.expiry,
+      batch: parsed.batch,
+      serial: parsed.serial,
+      qty: parsed.qty,
+      productName: match ? match.name : 'Unknown Product',
+      matchType: match ? match.matchType : 'NONE',
+      type: match ? (match.type || 'OTH') : 'OTH',
+      photo: null,
+      note: ''
+    };
+  }, [matchProduct]);
+
+  // Handle single scan submit
+  const handleScanSubmit = (e) => {
+    e.preventDefault();
+    if (!scanInput.trim()) return;
+    const item = processBarcode(scanInput);
+    if (!item) { haptic('error'); alert('Could not parse barcode.'); return; }
+    haptic('success');
+    setHistory(h => [item, ...h]);
+    setScanOverlay(item);
+    setScanInput('');
+  };
+
+  // Bulk process
+  const handleBulkProcess = () => {
+    const lines = bulkText.split('\n').map(l => l.trim()).filter(Boolean);
+    if (!lines.length) return;
+    const unknowns = [];
+    const known = [];
+    lines.forEach(line => {
+      const item = processBarcode(line);
+      if (!item) return;
+      if (item.matchType === 'NONE') unknowns.push(item);
+      else known.push(item);
+    });
+    // Unknowns go to front (need data entry), known process in background
+    haptic('success');
+    setHistory(h => [...unknowns, ...known, ...h]);
+    setBulkText('');
+    alert(`Processed ${lines.length} lines.\n⚠️ ${unknowns.length} unknown products added to top.`);
+  };
+
+  // Load photo for row
+  const handlePhotoUpload = (rowId, file) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = e => {
+      setHistory(h => h.map(r => r.id === rowId ? { ...r, photo: e.target.result } : r));
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // Edit a row
+  const saveEdit = (updated) => {
+    setHistory(h => h.map(r => r.id === updated.id ? updated : r));
+    setEditingRow(null);
+  };
+
+  // Master file load
+  const handleMasterFile = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      const text = ev.target.result;
+      const lines = text.split('\n').filter(Boolean);
+      const newEntries = lines.slice(1).map(line => {
+        const parts = line.split(/\t|,/);
+        return { gtin14: (parts[0]||'').trim(), gtin13: (parts[1]||'').trim(), name: (parts[2]||'').trim(), type: (parts[3]||'OTH').trim(), form: (parts[4]||'').trim() };
+      }).filter(r => r.gtin14 && r.name);
+      e.target.dataset.mode === 'append'
+        ? setMaster(m => { const existing = new Set(m.map(x => x.gtin14)); return [...m, ...newEntries.filter(x => !existing.has(x.gtin14))]; })
+        : setMaster(newEntries);
+      e.target.value = '';
+      alert(`Master updated: ${newEntries.length} records.`);
+    };
+    reader.readAsText(file);
+  };
+
+  // Export
+  const exportCSV = () => {
+    const headers = ['scanTime','gtin14','gtin13','expiry','batch','serial','qty','productName','matchType','type'];
+    const rows = history.map(r => headers.map(h => JSON.stringify(r[h] ?? '')).join(','));
+    const csv = [headers.join(','), ...rows].join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+    a.download = 'backwall-export.csv'; a.click();
+  };
+  const exportTSV = () => {
+    const headers = ['scanTime','gtin14','gtin13','expiry','batch','serial','qty','productName','matchType','type'];
+    const rows = history.map(r => headers.map(h => r[h] ?? '').join('\t'));
+    const tsv = [headers.join('\t'), ...rows].join('\n');
+    const blob = new Blob([tsv], { type: 'text/tab-separated-values' });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+    a.download = 'backwall-export.tsv'; a.click();
+  };
+  const backupJSON = () => {
+    const blob = new Blob([JSON.stringify({ history, master }, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+    a.download = 'backwall-backup.json'; a.click();
+  };
+  const restoreJSON = () => { fileInputRef.current?.click(); };
+  const handleRestoreFile = (e) => {
+    const file = e.target.files?.[0]; if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try {
+        const data = JSON.parse(ev.target.result);
+        if (data.history) setHistory(data.history);
+        if (data.master)  setMaster(data.master);
+        alert('Restore successful!');
+      } catch { alert('Invalid backup file.'); }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
+  const copyLastRow = () => {
+    if (!history.length) return;
+    const r = history[0];
+    navigator.clipboard.writeText(`${r.productName}\t${r.gtin14}\t${fmtDate(r.expiry)}\t${r.batch}`);
+    haptic('light');
+  };
+
+  // Filtered + sorted history
+  const processed = useMemo(() => {
+    let res = [...history];
+    if (searchQuery) {
+      const q = searchQuery.toLowerCase();
+      res = res.filter(r =>
+        (r.gtin14||'').includes(q) || (r.productName||'').toLowerCase().includes(q) ||
+        (r.batch||'').toLowerCase().includes(q) || (r.serial||'').toLowerCase().includes(q)
+      );
+    }
+    if (filters.expired || filters.soon || filters.missing) {
+      res = res.filter(r => {
+        const s = getExpiryStatus(r.expiry).status;
+        if (filters.expired && (s === 'expired' || s === 'critical')) return true;
+        if (filters.soon && s === 'warning') return true;
+        if (filters.missing && s === 'missing') return true;
+        return false;
+      });
+    }
+    res.sort((a, b) => {
+      let va = sortBy === 'scanTime' || sortBy === 'expiry' ? (a[sortBy] ? new Date(a[sortBy]).getTime() : 0) : a[sortBy];
+      let vb = sortBy === 'scanTime' || sortBy === 'expiry' ? (b[sortBy] ? new Date(b[sortBy]).getTime() : 0) : b[sortBy];
+      if (va < vb) return sortDir === 'asc' ? -1 : 1;
+      if (va > vb) return sortDir === 'asc' ? 1 : -1;
+      return 0;
+    });
+    return res;
+  }, [history, searchQuery, filters, sortBy, sortDir]);
+
+  // PIN
+  const handlePin = (e) => {
+    e.preventDefault();
+    if (pinInput === '9633') { setPinUnlocked(true); setPinInput(''); haptic('success'); }
+    else { haptic('error'); alert('Incorrect PIN'); setPinInput(''); }
+  };
+
+  const PinLock = ({ children }) => pinUnlocked ? children : (
+    <div className="flex flex-col items-center justify-center h-full max-w-sm mx-auto">
+      <div className="bg-white rounded-3xl shadow-sm border border-slate-100 p-8 w-full text-center">
+        <div className="w-16 h-16 bg-blue-50 rounded-full flex items-center justify-center mx-auto mb-6">
+          <Lock className="w-8 h-8 text-blue-900" />
+        </div>
+        <h2 className="text-xl font-bold text-slate-800 mb-1">PIN Required</h2>
+        <p className="text-sm text-slate-500 mb-6">Enter your 4-digit PIN to continue.</p>
+        <form onSubmit={handlePin} className="space-y-4">
+          <input type="password" maxLength={4} value={pinInput}
+            onChange={e => setPinInput(e.target.value.replace(/\D/g, ''))}
+            className="w-full text-center tracking-[1em] font-mono text-2xl py-4 border-2 border-slate-200 rounded-2xl focus:outline-none focus:border-blue-600 transition-colors"
+            placeholder="••••" autoFocus />
+          <button type="submit" disabled={pinInput.length !== 4}
+            className="w-full bg-blue-900 text-white py-4 rounded-2xl font-bold hover:bg-blue-800 disabled:opacity-40 transition-all">
+            Unlock
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+
+  // ── SCAN TAB ───────────────────────────────────────────────────
+  const ScanTab = () => (
+    <div className="flex flex-col gap-5 max-w-lg mx-auto">
+      {/* Status */}
+      <div className="flex justify-between items-center bg-white p-3 rounded-2xl shadow-sm border border-slate-100">
+        <div className="flex items-center gap-2">
+          <div className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
+          <span className="text-sm font-medium text-slate-700">Offline Ready</span>
+        </div>
+        <div className="text-sm text-slate-500">Master: <span className="font-bold text-blue-900">{master.length}</span></div>
+      </div>
+
+      {/* Camera mock */}
+      <div className="relative bg-slate-900 rounded-3xl overflow-hidden shadow-xl" style={{ aspectRatio:'4/5' }}>
+        <div className="absolute inset-0 opacity-20" style={{ background:'radial-gradient(circle at center, #60a5fa 0%, transparent 70%)' }} />
+        {/* brackets */}
+        <div className="absolute top-7 left-7 w-12 h-12 border-t-4 border-l-4 border-cyan-400 rounded-tl-xl" />
+        <div className="absolute top-7 right-7 w-12 h-12 border-t-4 border-r-4 border-cyan-400 rounded-tr-xl" />
+        <div className="absolute bottom-7 left-7 w-12 h-12 border-b-4 border-l-4 border-cyan-400 rounded-bl-xl" />
+        <div className="absolute bottom-7 right-7 w-12 h-12 border-b-4 border-r-4 border-cyan-400 rounded-br-xl" />
+        {/* scanning line */}
+        <div className="absolute left-8 right-8 h-0.5 bg-cyan-400 top-1/2"
+          style={{ boxShadow:'0 0 16px rgba(34,211,238,0.9)', animation:'scanLine 2s ease-in-out infinite alternate' }} />
+        <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-400">
+          <Camera className="w-12 h-12 opacity-40" />
+          <span className="text-sm mt-2 opacity-50">Camera Preview</span>
+        </div>
+      </div>
+
+      {/* Manual scan input */}
+      <form onSubmit={handleScanSubmit} className="flex gap-2">
+        <input value={scanInput} onChange={e => setScanInput(e.target.value)}
+          placeholder="Paste GS1 barcode here…"
+          className="flex-1 bg-white border border-slate-200 rounded-2xl px-4 py-3 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500 shadow-sm" />
+        <button type="submit"
+          className="bg-blue-900 text-white px-5 py-3 rounded-2xl font-bold hover:bg-blue-800 active:scale-95 transition-all shadow-sm">
+          <ScanLine className="w-5 h-5" />
+        </button>
+      </form>
+
+      {/* Action buttons */}
+      <div className="grid grid-cols-2 gap-3">
+        <button className="flex items-center justify-center gap-2 bg-blue-900 text-white py-4 rounded-2xl font-semibold shadow-md hover:bg-blue-800 active:scale-95 transition-all">
+          <ScanLine className="w-5 h-5 text-cyan-400" /> Start Scan
+        </button>
+        <button className="flex items-center justify-center gap-2 bg-white text-blue-900 border border-slate-200 py-4 rounded-2xl font-semibold shadow-sm hover:bg-slate-50 active:scale-95 transition-all">
+          <ImageIcon className="w-5 h-5 text-blue-500" /> Upload Image
+        </button>
+      </div>
+
+      {/* Last scanned */}
+      {history.length > 0 && (() => {
+        const r = history[0];
+        const es = getExpiryStatus(r.expiry);
+        const typeMeta = TYPE_META[r.type] || TYPE_META.OTH;
+        return (
+          <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+            <div className={`h-1.5 w-full ${EXPIRY_ROW_BG[es.status]}`} />
+            <div className="p-4">
+              <p className="text-xs text-slate-400 uppercase tracking-wider font-semibold mb-3">Last Scanned</p>
+              <div className="flex gap-3 items-start">
+                <ProductThumb name={r.productName} photo={r.photo} gtin={r.gtin14} />
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-start justify-between gap-2">
+                    <h3 className="font-bold text-slate-800 truncate">{r.productName}</h3>
+                    <span className={`px-2 py-0.5 rounded-full text-xs font-bold border flex-shrink-0 ${EXPIRY_BADGE_BG[es.color]}`}>
+                      {fmtDate(r.expiry)}
+                    </span>
+                  </div>
+                  <p className="text-xs font-mono text-slate-400 mt-0.5">{r.gtin14}</p>
+                  <div className="flex gap-2 mt-2 flex-wrap">
+                    <span className={`px-2 py-0.5 rounded-full text-xs font-bold border ${typeMeta.bg}`}>{typeMeta.icon} {typeMeta.label}</span>
+                    <span className="text-xs text-slate-500">Batch: <span className="font-mono font-bold">{r.batch || '—'}</span></span>
+                    <span className="text-xs text-slate-500">Qty: <span className="font-bold">{r.qty}</span></span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+    </div>
+  );
+
+  // ── BULK TAB ───────────────────────────────────────────────────
+  const BulkTab = () => (
+    <div className="flex flex-col gap-4 max-w-2xl mx-auto h-full">
+      <div className="bg-blue-50 border border-blue-100 p-4 rounded-2xl">
+        <h2 className="text-lg font-bold text-blue-900 flex items-center gap-2"><ClipboardList className="w-5 h-5" /> Bulk Paste</h2>
+        <p className="text-sm text-blue-700 mt-1">Paste multiple GS1 barcodes — one per line. <strong>Unknown products</strong> will appear at the top for manual data entry. Known products process in the background.</p>
+      </div>
+      <textarea value={bulkText} onChange={e => setBulkText(e.target.value)}
+        className="flex-1 w-full rounded-2xl border border-slate-200 p-4 font-mono text-sm shadow-sm focus:ring-2 focus:ring-blue-500 outline-none resize-none min-h-[200px]"
+        placeholder={"(01)05012345678900(17)241231(10)A1B2\n(01)05098765432100(17)231115(10)X9Y8"} />
+      <button onClick={handleBulkProcess}
+        className="w-full bg-blue-900 text-white py-4 rounded-2xl font-bold shadow-md hover:bg-blue-800 active:scale-95 transition-all">
+        Process Barcodes
+      </button>
+    </div>
+  );
+
+  // ── HISTORY TAB ────────────────────────────────────────────────
+  const HistoryTab = () => (
+    <div className="flex flex-col gap-4 h-full">
+      {/* Search + filters */}
+      <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-100 space-y-3">
+        <div className="relative">
+          <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+          <input value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
+            placeholder="Search GTIN, name, batch…"
+            className="w-full pl-9 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+        </div>
+        <div className="flex flex-wrap gap-2 items-center">
+          <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Filter:</span>
+          {[['expired','Expired ≤3mo','red'],['soon','4–6 mo','amber'],['missing','No Expiry','grey']].map(([key, label, col]) => (
+            <button key={key} onClick={() => setFilters(f => ({ ...f, [key]: !f[key] }))}
+              className={`px-3 py-1 rounded-full text-xs font-semibold border transition-colors
+                ${filters[key] ? EXPIRY_BADGE_BG[col] : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'}`}>
+              {label}
+            </button>
+          ))}
+        </div>
+        <div className="flex justify-between items-center pt-1 border-t border-slate-100">
+          <div className="flex gap-1">
+            {[['TSV', exportTSV], ['CSV', exportCSV]].map(([lbl, fn]) => (
+              <button key={lbl} onClick={fn} className="text-xs font-semibold text-blue-700 hover:bg-blue-50 px-2 py-1 rounded flex items-center gap-1">
+                <Download className="w-3 h-3" /> {lbl}
+              </button>
+            ))}
+          </div>
+          <button onClick={copyLastRow} className="text-xs font-semibold text-slate-600 hover:bg-slate-50 px-2 py-1 rounded flex items-center gap-1 border border-slate-200">
+            <Copy className="w-3 h-3" /> Copy Last
+          </button>
+        </div>
+      </div>
+
+      {/* Table */}
+      <div className="flex-1 bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+        <div className="overflow-x-auto overflow-y-auto max-h-[60vh]">
+          <table className="w-full text-sm whitespace-nowrap">
+            <thead className="bg-slate-50 text-slate-500 font-bold sticky top-0 z-10">
+              <tr>
+                <th className="px-3 py-3 text-left w-8"></th>
+                <th className="px-3 py-3 text-left cursor-pointer hover:bg-slate-100"
+                  onClick={() => { setSortBy('scanTime'); setSortDir(d => d === 'asc' ? 'desc' : 'asc'); }}>
+                  Time {sortBy === 'scanTime' && (sortDir === 'asc' ? '↑' : '↓')}
+                </th>
+                <th className="px-3 py-3 text-left">Product</th>
+                <th className="px-3 py-3 text-left">GTIN14</th>
+                <th className="px-3 py-3 text-left cursor-pointer hover:bg-slate-100"
+                  onClick={() => { setSortBy('expiry'); setSortDir(d => d === 'asc' ? 'desc' : 'asc'); }}>
+                  Expiry {sortBy === 'expiry' && (sortDir === 'asc' ? '↑' : '↓')}
+                </th>
+                <th className="px-3 py-3 text-left">Batch</th>
+                <th className="px-3 py-3 text-right">Qty</th>
+                <th className="px-3 py-3 text-left">Type</th>
+                <th className="px-3 py-3 text-left">Match</th>
+                <th className="px-3 py-3 text-left">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {processed.length === 0
+                ? <tr><td colSpan={10} className="px-4 py-10 text-center text-slate-400">No records found.</td></tr>
+                : processed.map(row => {
+                    const es = getExpiryStatus(row.expiry);
+                    const typeMeta = TYPE_META[row.type] || TYPE_META.OTH;
+                    const isExp = es.status === 'expired' || es.status === 'critical';
+                    const isExpanded = expandedRow === row.id;
+                    const isEditing  = editingRow?.id === row.id;
+                    return (
+                      <React.Fragment key={row.id}>
+                        <tr className={`border-t border-slate-100 hover:bg-slate-50 transition-colors cursor-pointer
+                          ${isExp ? 'bg-red-50/40' : ''}`}
+                          onClick={() => setExpandedRow(isExpanded ? null : row.id)}>
+                          {/* Expiry colour strip */}
+                          <td className="px-0 py-0 w-1.5">
+                            <div className={`h-full min-h-[48px] w-1.5 ${EXPIRY_ROW_BG[es.status]} rounded-l`} />
+                          </td>
+                          <td className="px-3 py-3 text-slate-500 text-xs">
+                            <div>{fmtDate(row.scanTime)}</div>
+                            <div>{fmtTime(row.scanTime)}</div>
+                          </td>
+                          <td className="px-3 py-3">
+                            <div className="flex items-center gap-2">
+                              <ProductThumb name={row.productName} photo={row.photo} gtin={row.gtin14} size="sm" />
+                              <span className={`font-semibold text-sm ${isExp ? 'text-red-700 line-through' : 'text-blue-900'}`}>
+                                {row.productName || 'Unknown'}
+                              </span>
+                            </div>
+                          </td>
+                          <td className="px-3 py-3 font-mono text-slate-600 text-xs">{row.gtin14}</td>
+                          <td className="px-3 py-3">
+                            <span className={`px-2 py-0.5 rounded-full text-xs font-bold border ${EXPIRY_BADGE_BG[es.color]}`}>
+                              {fmtDate(row.expiry)}
+                            </span>
+                          </td>
+                          <td className="px-3 py-3 font-mono text-slate-500 text-xs">{row.batch || '—'}</td>
+                          <td className="px-3 py-3 text-right font-bold text-slate-700">{row.qty}</td>
+                          <td className="px-3 py-3">
+                            <span className={`px-2 py-0.5 rounded-full text-xs font-bold border ${typeMeta.bg}`}>
+                              {typeMeta.icon} {typeMeta.label}
+                            </span>
+                          </td>
+                          <td className="px-3 py-3">
+                            <span className={`px-2 py-0.5 rounded-full text-xs font-bold border ${row.matchType === 'EXACT' ? EXPIRY_BADGE_BG.blue : row.matchType === 'NONE' ? EXPIRY_BADGE_BG.grey : EXPIRY_BADGE_BG.green}`}>
+                              {row.matchType}
+                            </span>
+                          </td>
+                          <td className="px-3 py-3">
+                            <div className="flex gap-1" onClick={e => e.stopPropagation()}>
+                              <button className="text-blue-500 hover:text-blue-700 p-1 rounded" title="Edit"
+                                onClick={() => setEditingRow(isEditing ? null : { ...row })}>
+                                <Eye className="w-4 h-4" />
+                              </button>
+                              <button className="text-red-400 hover:text-red-600 p-1 rounded" title="Delete"
+                                onClick={() => { haptic('light'); setHistory(h => h.filter(r => r.id !== row.id)); }}>
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+
+                        {/* Expanded row */}
+                        {isExpanded && !isEditing && (
+                          <tr className="bg-slate-50/80 border-t border-slate-100">
+                            <td colSpan={10} className="px-4 py-4">
+                              <div className="flex flex-wrap gap-4 items-start">
+                                <ProductThumb name={row.productName} photo={row.photo} gtin={row.gtin14} size="md" />
+                                <div className="flex-1 min-w-[200px]">
+                                  <div className="text-xs text-slate-400 font-mono mb-1">Raw: {row.raw}</div>
+                                  <div className="text-xs text-slate-500">Serial: {row.serial || '—'} | Note: {row.note || '—'}</div>
+                                </div>
+                                <div className="flex gap-2 flex-wrap">
+                                  <label className="cursor-pointer">
+                                    <input type="file" accept="image/*" className="hidden"
+                                      onChange={e => handlePhotoUpload(row.id, e.target.files?.[0])} />
+                                    <span className="px-3 py-1.5 rounded-xl bg-blue-50 text-blue-700 text-xs font-bold border border-blue-200 hover:bg-blue-100 flex items-center gap-1">
+                                      <ImageIcon className="w-3 h-3" /> Add Photo
+                                    </span>
+                                  </label>
+                                  <button onClick={() => setEditingRow({ ...row })}
+                                    className="px-3 py-1.5 rounded-xl bg-slate-100 text-slate-700 text-xs font-bold border border-slate-200 hover:bg-slate-200">
+                                    Edit Data
+                                  </button>
+                                </div>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+
+                        {/* Edit row */}
+                        {isEditing && (
+                          <tr className="bg-blue-50/60 border-t border-blue-100">
+                            <td colSpan={10} className="px-4 py-4">
+                              <EditRowForm row={editingRow} onSave={saveEdit} onCancel={() => setEditingRow(null)} />
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
+                    );
+                  })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+
+  // ── MASTER TAB ─────────────────────────────────────────────────
+  const MasterTab = () => (
+    <PinLock>
+      <div className="flex flex-col gap-6 max-w-2xl mx-auto">
+        <div className="bg-white p-6 rounded-3xl shadow-sm border border-slate-100 text-center">
+          <Database className="w-12 h-12 text-blue-900 mx-auto mb-4" />
+          <h2 className="text-2xl font-bold text-slate-800">Master Database</h2>
+          <p className="text-slate-500 mt-1">Manage your offline product matching index.</p>
+          <div className="mt-6 grid grid-cols-2 gap-4">
+            <div className="bg-blue-50 rounded-2xl p-4 border border-blue-100">
+              <span className="block text-3xl font-bold text-blue-900">{master.length}</span>
+              <span className="text-xs font-bold text-blue-700 uppercase tracking-wider">Products</span>
+            </div>
+            <div className="bg-emerald-50 rounded-2xl p-4 border border-emerald-100">
+              <span className="block text-3xl font-bold text-emerald-700">Ready</span>
+              <span className="text-xs font-bold text-emerald-600 uppercase tracking-wider">Status</span>
+            </div>
+          </div>
+        </div>
+
+        <div className="bg-white p-6 rounded-3xl shadow-sm border border-slate-100">
+          <h3 className="text-lg font-bold text-slate-800 mb-2">Upload Master File</h3>
+          <p className="text-sm text-slate-500 mb-4">CSV/TSV format: <span className="font-mono text-xs bg-slate-100 px-2 py-0.5 rounded">gtin14, gtin13, name, type, form</span></p>
+
+          <label className="block border-2 border-dashed border-slate-200 rounded-2xl p-8 text-center hover:bg-slate-50 transition-colors cursor-pointer">
+            <Upload className="w-8 h-8 text-slate-400 mx-auto mb-2" />
+            <p className="text-sm font-semibold text-slate-700">Tap to select file</p>
+            <p className="text-xs text-slate-400 mt-1">.csv or .tsv</p>
+            <input ref={masterFileRef} type="file" accept=".csv,.tsv,.txt" className="hidden"
+              onChange={handleMasterFile} />
+          </label>
+
+          <div className="mt-4 flex gap-3">
+            <button onClick={() => { masterFileRef.current.dataset.mode = 'append'; masterFileRef.current.click(); }}
+              className="flex-1 bg-white text-blue-900 border border-slate-200 py-3 rounded-xl font-semibold hover:bg-slate-50 transition-colors">
+              ➕ Append to Existing
+            </button>
+            <button onClick={() => { masterFileRef.current.dataset.mode = 'replace'; masterFileRef.current.click(); }}
+              className="flex-1 bg-red-50 text-red-700 border border-red-200 py-3 rounded-xl font-semibold hover:bg-red-100 transition-colors">
+              🔄 Replace All
+            </button>
+          </div>
+        </div>
+
+        {/* Preview top 10 */}
+        <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+          <div className="px-4 py-3 border-b border-slate-100 flex justify-between items-center">
+            <span className="font-bold text-slate-800 text-sm">Current Master (top 10)</span>
+            <span className="text-xs text-slate-400">{master.length} total</span>
+          </div>
+          <div className="divide-y divide-slate-100">
+            {master.slice(0, 10).map((m, i) => {
+              const tm = TYPE_META[m.type] || TYPE_META.OTH;
+              return (
+                <div key={i} className="flex items-center gap-3 px-4 py-3">
+                  <ProductThumb name={m.name} gtin={m.gtin14} size="sm" />
+                  <div className="flex-1 min-w-0">
+                    <div className="font-semibold text-slate-800 text-sm truncate">{m.name}</div>
+                    <div className="text-xs font-mono text-slate-400">{m.gtin14}</div>
+                  </div>
+                  <span className={`px-2 py-0.5 rounded-full text-xs font-bold border ${tm.bg}`}>{tm.icon} {tm.label}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </PinLock>
+  );
+
+  // ── BACKUP TAB ─────────────────────────────────────────────────
+  const BackupTab = () => (
+    <PinLock>
+      <div className="flex flex-col gap-6 max-w-2xl mx-auto">
+        <div className="bg-white p-6 rounded-3xl shadow-sm border border-slate-100 text-center">
+          <Archive className="w-12 h-12 text-blue-900 mx-auto mb-4" />
+          <h2 className="text-2xl font-bold text-slate-800">Backup & Restore</h2>
+          <p className="text-slate-500 mt-1">Export or import all application data securely.</p>
+        </div>
+        <div className="bg-white p-6 rounded-3xl shadow-sm border border-slate-100 space-y-4">
+          {[
+            { title: 'Export JSON Backup', desc: 'Download full database', action: backupJSON, label: 'Download', variant: 'primary' },
+            { title: 'Export CSV',         desc: 'Spreadsheet format',     action: exportCSV,  label: 'Download', variant: 'secondary' },
+            { title: 'Export TSV',         desc: 'Tab-separated values',   action: exportTSV,  label: 'Download', variant: 'secondary' },
+            { title: 'Restore from JSON',  desc: 'Upload a backup file',   action: restoreJSON,label: 'Upload',   variant: 'outline' },
+          ].map(({ title, desc, action, label, variant }) => (
+            <div key={title} className="flex items-center justify-between p-4 bg-slate-50 rounded-2xl border border-slate-200">
+              <div>
+                <h4 className="font-bold text-slate-800">{title}</h4>
+                <p className="text-sm text-slate-500">{desc}</p>
+              </div>
+              <button onClick={action}
+                className={`px-4 py-2 rounded-xl font-semibold transition-colors
+                  ${variant === 'primary' ? 'bg-blue-900 text-white hover:bg-blue-800' :
+                    variant === 'secondary' ? 'bg-blue-50 text-blue-900 border border-blue-200 hover:bg-blue-100' :
+                    'bg-white text-slate-700 border border-slate-200 hover:bg-slate-50'}`}>
+                {label}
+              </button>
+            </div>
+          ))}
+        </div>
+        <input ref={fileInputRef} type="file" accept=".json" className="hidden" onChange={handleRestoreFile} />
+      </div>
+    </PinLock>
+  );
+
+  // ── NAV tabs ───────────────────────────────────────────────────
+  const NAV = [
+    { id: 'scan',    label: 'Scan',    Icon: Camera },
+    { id: 'bulk',    label: 'Paste',   Icon: ClipboardList },
+    { id: 'history', label: 'History', Icon: Database },
+  ];
+
+  return (
+    <div className="flex flex-col h-screen bg-slate-100 font-sans selection:bg-blue-200">
+      <style>{`
+        @keyframes scanLine {
+          from { transform: translateY(-60px); }
+          to   { transform: translateY(60px);  }
+        }
+        @keyframes bounceIn {
+          0%   { transform: scale(.7); opacity: 0; }
+          60%  { transform: scale(1.08); opacity: 1; }
+          100% { transform: scale(1); }
+        }
+        .animate-bounce-in { animation: bounceIn .4s ease forwards; }
+      `}</style>
+
+      {scanOverlay && <ScanSuccessOverlay item={scanOverlay} onDone={() => setScanOverlay(null)} />}
+
+      {/* Header */}
+      <header className="flex-shrink-0 bg-blue-900 text-white shadow-md z-20">
+        <div className="flex items-center justify-between p-4 max-w-7xl mx-auto">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 bg-white/10 rounded-xl flex items-center justify-center border border-white/20">
+              <Database className="w-6 h-6 text-cyan-400" />
+            </div>
+            <div>
+              <h1 className="text-xl font-black tracking-tight">BackWall Expiry</h1>
+              <p className="text-xs text-blue-200 font-semibold tracking-widest uppercase">Pharmacy Tool</p>
+            </div>
+          </div>
+
+          <button onClick={() => setIsMenuOpen(!isMenuOpen)} className="p-2 rounded-xl hover:bg-white/10 lg:hidden">
+            {isMenuOpen ? <X className="w-6 h-6" /> : <Menu className="w-6 h-6" />}
+          </button>
+
+          {/* Desktop nav */}
+          <div className="hidden lg:flex items-center gap-1 bg-blue-950 p-1.5 rounded-2xl">
+            {NAV.map(({ id, label }) => (
+              <button key={id} onClick={() => setActiveTab(id)}
+                className={`px-4 py-2 rounded-xl text-sm font-bold transition-colors ${activeTab === id ? 'bg-blue-600 text-white' : 'text-blue-200 hover:text-white'}`}>
+                {label}
+              </button>
+            ))}
+            <div className="w-px h-5 bg-blue-800 mx-1" />
+            {[['master','Master'],['backup','Backup']].map(([id, label]) => (
+              <button key={id} onClick={() => setActiveTab(id)}
+                className={`px-4 py-2 rounded-xl text-sm font-bold flex items-center gap-1.5 transition-colors ${activeTab === id ? 'bg-blue-600 text-white' : 'text-blue-200 hover:text-white'}`}>
+                <Lock className="w-3 h-3" /> {label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </header>
+
+      {/* Mobile menu */}
+      {isMenuOpen && (
+        <div className="absolute top-[72px] left-0 right-0 bg-white shadow-xl z-30 lg:hidden border-b border-slate-200">
+          <div className="p-4 space-y-1">
+            <div className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2 px-2">Secure</div>
+            {[['master','Master Data',Upload],['backup','Backup & Restore',Archive]].map(([id, label, Icon]) => (
+              <button key={id} onClick={() => { setActiveTab(id); setIsMenuOpen(false); }}
+                className="w-full flex items-center justify-between p-3 rounded-xl hover:bg-slate-50 text-slate-700 font-semibold">
+                <div className="flex items-center gap-3"><Icon className="w-5 h-5 text-blue-600" /> {label}</div>
+                <Lock className="w-4 h-4 text-slate-400" />
+              </button>
+            ))}
+            {pinUnlocked && (
+              <button onClick={() => { setPinUnlocked(false); setIsMenuOpen(false); }}
+                className="w-full flex items-center gap-3 p-3 mt-2 rounded-xl bg-slate-100 text-slate-700 font-semibold">
+                <Lock className="w-5 h-5 text-slate-400" /> Lock Session
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Main */}
+      <main className="flex-1 overflow-y-auto p-4 lg:p-8 pb-24 lg:pb-8 max-w-7xl mx-auto w-full">
+        {activeTab === 'scan'    && <ScanTab />}
+        {activeTab === 'bulk'    && <BulkTab />}
+        {activeTab === 'history' && <HistoryTab />}
+        {activeTab === 'master'  && <MasterTab />}
+        {activeTab === 'backup'  && <BackupTab />}
+      </main>
+
+      {/* Mobile bottom nav */}
+      <nav className="lg:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 shadow-lg z-40">
+        <div className="flex justify-around items-center h-16">
+          {NAV.map(({ id, label, Icon }) => (
+            <button key={id} onClick={() => { setActiveTab(id); haptic('light'); }}
+              className={`flex flex-col items-center justify-center w-full h-full gap-1 transition-colors ${activeTab === id ? 'text-blue-700' : 'text-slate-400'}`}>
+              <Icon className="w-5 h-5" />
+              <span className="text-[10px] font-bold">{label}</span>
+            </button>
+          ))}
+        </div>
+      </nav>
+    </div>
+  );
+}
+
+// ── Edit row form ─────────────────────────────────────────────────
+function EditRowForm({ row, onSave, onCancel }) {
+  const [form, setForm] = useState({ ...row });
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+  return (
+    <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+      {[
+        ['productName', 'Product Name', 'text'],
+        ['gtin14',      'GTIN14',       'text'],
+        ['expiry',      'Expiry',       'date'],
+        ['batch',       'Batch',        'text'],
+        ['serial',      'Serial',       'text'],
+        ['qty',         'Qty',          'number'],
+        ['note',        'Note',         'text'],
+      ].map(([key, label, type]) => (
+        <div key={key} className={key === 'productName' || key === 'note' ? 'col-span-2' : ''}>
+          <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">{label}</label>
+          <input type={type} value={form[key] || ''} onChange={e => set(key, e.target.value)}
+            className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" />
+        </div>
+      ))}
+      <div>
+        <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">Type</label>
+        <select value={form.type || 'OTH'} onChange={e => set('type', e.target.value)}
+          className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400">
+          {Object.keys(TYPE_META).map(t => <option key={t} value={t}>{t}</option>)}
+        </select>
+      </div>
+      <div className="col-span-2 flex gap-2 pt-2">
+        <button onClick={() => onSave(form)} className="flex-1 bg-blue-900 text-white py-2 rounded-xl font-bold hover:bg-blue-800 transition-colors">Save</button>
+        <button onClick={onCancel} className="flex-1 bg-slate-100 text-slate-700 py-2 rounded-xl font-bold hover:bg-slate-200 transition-colors">Cancel</button>
+      </div>
+    </div>
+  );
+}
